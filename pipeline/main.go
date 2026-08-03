@@ -106,7 +106,7 @@ func main() {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	// Semaphore to limit concurrent HTTP requests to 50 so we don't crash OPA
-	sem := make(chan struct{}, 50) 
+	sem := make(chan struct{}, 50)
 
 	// Reusable HTTP client so we don't exhaust local ports
 	client := &http.Client{
@@ -140,7 +140,9 @@ func main() {
 			loanValueEUR = loanValue
 		} else {
 			rate, exists := rates[currency]
-			if !exists { continue }
+			if !exists {
+				continue
+			}
 			loanValueEUR = loanValue / rate
 		}
 
@@ -174,7 +176,9 @@ func main() {
 			jsonData, _ := json.Marshal(reqBody)
 
 			resp, err := client.Post("http://localhost:8181/v1/data/compliance", "application/json", bytes.NewBuffer(jsonData))
-			if err != nil { return }
+			if err != nil {
+				return
+			}
 
 			var opaResult OPAResponse
 			if err := json.NewDecoder(resp.Body).Decode(&opaResult); err != nil {
@@ -191,10 +195,16 @@ func main() {
 			if !opaResult.Result.Allow {
 				report.TotalFailures++
 				violationsStr := strings.Join(opaResult.Result.Violations, "; ")
-				
-				if strings.Contains(violationsStr, "Rule 1") { report.Rule1Fails++ }
-				if strings.Contains(violationsStr, "Rule 2") { report.Rule2Fails++ }
-				if strings.Contains(violationsStr, "Rule 3") { report.Rule3Fails++ }
+
+				if strings.Contains(violationsStr, "Rule 1") {
+					report.Rule1Fails++
+				}
+				if strings.Contains(violationsStr, "Rule 2") {
+					report.Rule2Fails++
+				}
+				if strings.Contains(violationsStr, "Rule 3") {
+					report.Rule3Fails++
+				}
 
 				details := fmt.Sprintf("Loan Value: %.2f %s | Asset Value: %.2f %s | HQ: %s", lVal, cur, aVal, cur, hq)
 
