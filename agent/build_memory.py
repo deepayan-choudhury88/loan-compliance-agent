@@ -1,8 +1,13 @@
+import os
+from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-import os
+# REMOVED: from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_openai import AzureOpenAIEmbeddings # ADDED: Azure integration
+
+# Load credentials from .env
+load_dotenv()
 
 # Define paths
 PDF_PATH = "../data/company-reference.pdf"
@@ -27,15 +32,20 @@ def build_vector_db():
     )
     docs = text_splitter.split_documents(pages)
     
-    print("Generating embeddings and building FAISS database (this may take a few seconds)...")
-    # 3. Convert text to vectors using a fast, local open-source embedding model
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    print("Generating embeddings via Azure and building FAISS database...")
+    # 3. Convert text to vectors using Azure's text-embedding-3-small
+    embeddings = AzureOpenAIEmbeddings(
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        azure_deployment=os.getenv("AZURE_EMBEDDING_DEPLOYMENT_NAME")
+    )
     
     # 4. Create and save the vector database
     vector_store = FAISS.from_documents(docs, embeddings)
     vector_store.save_local(DB_PATH)
     
-    print(f"Success! Embedded {len(docs)} chunks into the local vector database.")
+    print(f"✅ Success! Embedded {len(docs)} chunks into the local vector database using Azure OpenAI.")
 
 if __name__ == "__main__":
     build_vector_db()

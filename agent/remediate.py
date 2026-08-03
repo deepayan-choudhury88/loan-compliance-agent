@@ -1,11 +1,12 @@
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
 from operator import itemgetter
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -17,6 +18,8 @@ app = Flask(__name__)
 CORS(app) # Enable Cross-Origin Resource Sharing
 
 print("Loading company policy memory & AI components...")
+
+# 1. This uses the gpt-5.4-mini model via the env variable
 llm = AzureChatOpenAI(
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
@@ -25,7 +28,15 @@ llm = AzureChatOpenAI(
     temperature=0.1,
 )
 
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# 2. UPDATED: Now using Azure's text-embedding-3-small instead of local HuggingFace
+embeddings = AzureOpenAIEmbeddings(
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+    azure_deployment=os.getenv("AZURE_EMBEDDING_DEPLOYMENT_NAME")
+)
+
+# 3. Load FAISS (WARNING: See Step 3 below)
 vector_store = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
 retriever = vector_store.as_retriever(search_kwargs={"k": 4})
 
