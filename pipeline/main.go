@@ -5,34 +5,22 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
-// Static lookup table mapping HQ Country to Expected Currency
 var countryToCurrency = map[string]string{
-	"Germany":        "EUR",
-	"Ireland":        "EUR",
-	"Spain":          "EUR",
-	"France":         "EUR",
-	"Italy":          "EUR",
-	"Netherlands":    "EUR",
-	"Portugal":       "EUR",
-	"Belgium":        "EUR",
-	"Austria":        "EUR",
-	"Finland":        "EUR",
-	"Luxembourg":     "EUR",
-	"United Kingdom": "GBP",
-	"United States":  "USD",
-	"Switzerland":    "CHF",
-	"Sweden":         "SEK",
-	"Poland":         "PLN",
-	"Japan":          "JPY",
-	"Canada":         "CAD",
+	"Germany": "EUR", "Ireland": "EUR", "Spain": "EUR", "France": "EUR",
+	"Italy": "EUR", "Netherlands": "EUR", "Portugal": "EUR", "Belgium": "EUR",
+	"Austria": "EUR", "Finland": "EUR", "Luxembourg": "EUR",
+	"United Kingdom": "GBP", "United States": "USD", "Switzerland": "CHF",
+	"Sweden": "SEK", "Poland": "PLN", "Japan": "JPY", "Canada": "CAD",
 }
 
 type ExchangeRates struct {
@@ -52,12 +40,28 @@ type LoanInput struct {
 	ExpectedCurrency string  `json:"expected_currency"`
 }
 
-// Updated to parse the 'allow' boolean and the 'violations' array from OPA
 type OPAResponse struct {
 	Result struct {
 		Allow      bool     `json:"allow"`
 		Violations []string `json:"violations"`
 	} `json:"result"`
+}
+
+type ReportData struct {
+	TotalLoansChecked int
+	TotalFailures     int
+	Rule1Fails        int
+	Rule2Fails        int
+	Rule3Fails        int
+	Portfolio         map[string]float64
+	FailedLoans       []FailedLoan
+}
+
+type FailedLoan struct {
+	LoanID      string
+	Company     string
+	Violations  string
+	LoanDetails string
 }
 
 func fetchRates() (map[string]float64, error) {
@@ -67,7 +71,6 @@ func fetchRates() (map[string]float64, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	var data ExchangeRates
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
@@ -80,8 +83,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to fetch exchange rates: %v", err)
 	}
-	rates["EUR"] = 1.0 
-	fmt.Println("Successfully cached FX rates.")
+	rates["EUR"] = 1.0
 
 	file, err := os.Open("../data/loans.csv")
 	if err != nil {
@@ -90,8 +92,13 @@ func main() {
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	if _, err = reader.Read(); err != nil { // Skip header
+	if _, err = reader.Read(); err != nil {
 		log.Fatalf("Failed to read header: %v", err)
+	}
+
+	report := ReportData{
+		Portfolio:   make(map[string]float64),
+		FailedLoans: []FailedLoan{},
 	}
 
 	rowCount := 0
@@ -101,7 +108,6 @@ func main() {
 			break
 		}
 		if err != nil {
-			log.Printf("Error reading row: %v", err)
 			continue
 		}
 
@@ -109,28 +115,28 @@ func main() {
 		loanValue, _ := strconv.ParseFloat(record[6], 64)
 		currency := record[7]
 		hqCountry := record[2]
+		companyName := record[1]
 
 		var loanValueEUR float64
 		if currency == "EUR" {
 			loanValueEUR = loanValue
 		} else {
 			rate, exists := rates[currency]
-			if !exists {
-				log.Printf("Warning: Exchange rate for %s not found. Skipping loan %s.", currency, record[0])
-				continue
-			}
-			loanValueEUR = loanValue / rate 
+			if !exists { continue }
+			loanValueEUR = loanValue / rate
 		}
 
-		// Look up expected currency, default to UNKNOWN if not in map
 		expectedCurrency, exists := countryToCurrency[hqCountry]
 		if !exists {
 			expectedCurrency = "UNKNOWN"
 		}
 
+		report.Portfolio[companyName] += loanValueEUR
+		report.TotalLoansChecked++
+
 		loanInput := LoanInput{
 			LoanID:           record[0],
-			CompanyName:      record[1],
+			CompanyName:      companyName,
 			HQCountry:        hqCountry,
 			AssetDescription: record[3],
 			AssetValue:       assetValue,
@@ -141,39 +147,191 @@ func main() {
 			ExpectedCurrency: expectedCurrency,
 		}
 
-		// 1. Wrap the loan in the "input" object OPA expects
-		reqBody := map[string]interface{}{
-			"input": loanInput,
-		}
+		reqBody := map[string]interface{}{"input": loanInput}
 		jsonData, _ := json.Marshal(reqBody)
 
-		// 2. Send the POST request to OPA (updated endpoint to match 'package compliance')
 		resp, err := http.Post("http://localhost:8181/v1/data/compliance", "application/json", bytes.NewBuffer(jsonData))
-		if err != nil {
-			log.Printf("Failed to call OPA for LoanID %s: %v", loanInput.LoanID, err)
-			continue
-		}
+		if err != nil { continue }
 
-		// 3. Parse the OPA result
 		var opaResult OPAResponse
 		if err := json.NewDecoder(resp.Body).Decode(&opaResult); err != nil {
-			log.Printf("Failed to parse OPA response for LoanID %s: %v", loanInput.LoanID, err)
 			resp.Body.Close()
 			continue
 		}
 		resp.Body.Close()
 
-		// 4. Print the result
-		if opaResult.Result.Allow {
-			fmt.Printf("LoanID: %s | Status: PASSED\n", loanInput.LoanID)
-		} else {
-			fmt.Printf("LoanID: %s | Status: FAILED | Violations: %v\n", loanInput.LoanID, opaResult.Result.Violations)
+		if !opaResult.Result.Allow {
+			report.TotalFailures++
+			violationsStr := strings.Join(opaResult.Result.Violations, "; ")
+			
+			if strings.Contains(violationsStr, "Rule 1") { report.Rule1Fails++ }
+			if strings.Contains(violationsStr, "Rule 2") { report.Rule2Fails++ }
+			if strings.Contains(violationsStr, "Rule 3") { report.Rule3Fails++ }
+
+			details := fmt.Sprintf("Loan Value: %.2f %s | Asset Value: %.2f %s | HQ: %s", loanValue, currency, assetValue, currency, hqCountry)
+
+			report.FailedLoans = append(report.FailedLoans, FailedLoan{
+				LoanID:      loanInput.LoanID,
+				Company:     loanInput.CompanyName,
+				Violations:  violationsStr,
+				LoanDetails: details,
+			})
 		}
 
 		rowCount++
-		// Stop after 10 rows for testing purposes
-		if rowCount >= 10 {
-			break
-		}
+		if rowCount >= 100 { break }
 	}
+
+	generateHTMLReport(report)
+}
+
+func generateHTMLReport(data ReportData) {
+	htmlTemplate := `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Compliance Review Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans p-8">
+    <div class="max-w-7xl mx-auto">
+        <h1 class="text-3xl font-bold mb-8 text-gray-900">Loan Compliance Report</h1>
+        
+        <div class="grid grid-cols-4 gap-4 mb-8">
+            <div class="bg-white p-6 rounded-lg shadow-sm border border-gray-200">
+                <h3 class="text-sm font-medium text-gray-500 uppercase">Total Checked</h3>
+                <p class="text-3xl font-bold">{{.TotalLoansChecked}}</p>
+            </div>
+            <div class="bg-red-50 p-6 rounded-lg shadow-sm border border-red-100">
+                <h3 class="text-sm font-medium text-red-500 uppercase">Rule 1 Failures</h3>
+                <p class="text-3xl font-bold text-red-700">{{.Rule1Fails}}</p>
+            </div>
+            <div class="bg-orange-50 p-6 rounded-lg shadow-sm border border-orange-100">
+                <h3 class="text-sm font-medium text-orange-500 uppercase">Rule 2 Failures</h3>
+                <p class="text-3xl font-bold text-orange-700">{{.Rule2Fails}}</p>
+            </div>
+            <div class="bg-yellow-50 p-6 rounded-lg shadow-sm border border-yellow-100">
+                <h3 class="text-sm font-medium text-yellow-500 uppercase">Rule 3 Failures</h3>
+                <p class="text-3xl font-bold text-yellow-700">{{.Rule3Fails}}</p>
+            </div>
+        </div>
+
+        <div class="bg-white rounded-lg shadow-sm border border-gray-200 mb-8 overflow-hidden">
+            <div class="px-6 py-4 border-b border-gray-200 bg-gray-50">
+                <h2 class="text-lg font-semibold text-gray-800">Action Required: Compliance Failures</h2>
+            </div>
+            <table class="min-w-full divide-y divide-gray-200">
+                <thead class="bg-gray-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Loan ID</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Company</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Violations</th>
+                        <th class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-gray-200">
+                    {{range .FailedLoans}}
+                    <tr id="row-{{.LoanID}}" class="hover:bg-gray-50 transition-colors">
+                        <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{{.LoanID}}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{.Company}}</td>
+                        <td class="px-6 py-4 text-sm text-red-600">{{.Violations}}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                            <button id="btn-{{.LoanID}}" class="text-indigo-600 font-bold hover:text-indigo-900 mr-4" onclick="getAIFix('{{.LoanID}}', '{{.Company}}', '{{.Violations}}', '{{.LoanDetails}}')">Get AI Fix</button>
+                            <button class="text-gray-400 hover:text-gray-600 font-bold mr-4" onclick="resolveLoan('{{.LoanID}}', 'ignored')">Ignore</button> 
+                            <button class="text-green-600 hover:text-green-900 font-bold" onclick="resolveLoan('{{.LoanID}}', 'fixed')">Fix</button>
+                        </td>
+                    </tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        async function getAIFix(loanID, company, violations, loanDetails) {
+            const btn = document.getElementById('btn-' + loanID);
+            const tr = document.getElementById('row-' + loanID);
+            
+            const originalText = btn.innerText;
+            btn.innerText = 'Analyzing...';
+            btn.disabled = true;
+
+            // Remove existing result row if it was clicked before
+            const existingRes = document.getElementById('res-' + loanID);
+            if (existingRes) existingRes.remove();
+
+            try {
+                const response = await fetch('http://localhost:5000/api/remediate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        company_name: company,
+                        violations: violations,
+                        loan_details: loanDetails
+                    })
+                });
+                const data = await response.json();
+                
+                // Create a new row to display the AI response gracefully
+                const newRow = document.createElement('tr');
+                newRow.id = 'res-' + loanID;
+                newRow.className = 'bg-indigo-50 border-l-4 border-indigo-500';
+                
+                // Convert simple Markdown bolding and newlines to HTML
+                const formattedText = data.remediation
+                    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                    .replace(/\n/g, '<br/>');
+                
+                newRow.innerHTML = '<td colspan="4" class="px-6 py-4 text-sm text-gray-800">' + formattedText + '</td>';
+                tr.parentNode.insertBefore(newRow, tr.nextSibling);
+
+            } catch (error) {
+                alert("Error connecting to Python backend: " + error);
+            } finally {
+                btn.innerText = 'AI Fix Ready';
+                btn.disabled = false;
+            }
+        }
+
+        function resolveLoan(loanID, action) {
+            const row = document.getElementById('row-' + loanID);
+            const aiRow = document.getElementById('res-' + loanID);
+            
+            if (action === 'fixed') {
+                row.className = 'bg-green-50 transition-colors opacity-75';
+                row.querySelector('td:nth-child(3)').innerHTML = '<span class="text-green-700 font-bold">✓ Manually Fixed</span>';
+            } else if (action === 'ignored') {
+                row.className = 'bg-gray-100 transition-colors opacity-50';
+                row.querySelector('td:nth-child(3)').innerHTML = '<span class="text-gray-500 font-bold">∅ Ignored</span>';
+            }
+            
+            // Remove the action buttons so it can't be clicked again
+            row.querySelector('td:nth-child(4)').innerHTML = '<span class="text-gray-500 text-sm">Resolved</span>';
+            
+            // Hide the AI suggestion row if it was open
+            if (aiRow) {
+                aiRow.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>`
+
+	tmpl, err := template.New("report").Parse(htmlTemplate)
+	if err != nil {
+		log.Fatalf("Template parsing failed: %v", err)
+	}
+
+	file, err := os.Create("compliance_report.html")
+	if err != nil {
+		log.Fatalf("Failed to create HTML report: %v", err)
+	}
+	defer file.Close()
+
+	if err := tmpl.Execute(file, data); err != nil {
+		log.Fatalf("Failed to execute template: %v", err)
+	}
+
+	fmt.Println("✅ Success! Interactive report generated at: compliance_report.html")
 }
