@@ -179,7 +179,6 @@ func main() {
 		}
 
 		rowCount++
-		if rowCount >= 100 { break }
 	}
 
 	generateHTMLReport(report)
