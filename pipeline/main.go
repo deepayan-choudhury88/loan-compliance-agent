@@ -49,13 +49,16 @@ type OPAResponse struct {
 }
 
 type ReportData struct {
-	TotalLoansChecked int
-	TotalFailures     int
-	Rule1Fails        int
-	Rule2Fails        int
-	Rule3Fails        int
-	Portfolio         map[string]float64
-	FailedLoans       []FailedLoan
+	TotalLoansChecked      int
+	TotalLoansPassed       int // NEW: Tracks passed loans
+	TotalFailures          int
+	Rule1Fails             int
+	Rule2Fails             int
+	Rule3Fails             int
+	TotalOverPledgedAssets int            // Tracks how many unique assets are reused
+	AssetUsage             map[string]int // Internal map to count asset frequency
+	Portfolio              map[string]float64
+	FailedLoans            []FailedLoan
 }
 
 type FailedLoan struct {
@@ -99,6 +102,7 @@ func main() {
 
 	report := ReportData{
 		Portfolio:   make(map[string]float64),
+		AssetUsage:  make(map[string]int),
 		FailedLoans: []FailedLoan{},
 	}
 
@@ -192,6 +196,12 @@ func main() {
 			report.Portfolio[cName] += lValEUR
 			report.TotalLoansChecked++
 
+			// ASSET DOUBLE-PLEDGE TRACKER
+			report.AssetUsage[aDesc]++
+			if report.AssetUsage[aDesc] == 2 {
+				report.TotalOverPledgedAssets++
+			}
+
 			if !opaResult.Result.Allow {
 				report.TotalFailures++
 				violationsStr := strings.Join(opaResult.Result.Violations, "; ")
@@ -214,13 +224,16 @@ func main() {
 					Violations:  violationsStr,
 					LoanDetails: details,
 				})
+			} else {
+				// NEW: If the loan passes without violations, increment the success counter
+				report.TotalLoansPassed++
 			}
 			mu.Unlock() // MUTEX UNLOCK
 		}(loanID, companyName, hqCountry, assetDesc, assetOwner, currency, expectedCurrency, assetValue, loanValue, loanValueEUR)
 	}
 
 	fmt.Println("Processing all rows concurrently... please wait.")
-	wg.Wait() // Wait for all 100,000 goroutines to finish
+	wg.Wait() // Wait for all goroutines to finish
 
 	generateHTMLReport(report)
 }
@@ -238,11 +251,24 @@ func generateHTMLReport(data ReportData) {
     <div class="max-w-7xl mx-auto">
         <h1 class="text-3xl font-bold mb-8 text-gray-900">Loan Compliance Report</h1>
         
-        <div class="grid grid-cols-4 gap-4 mb-8">
+        <!-- NEW: Changed grid-cols-5 to grid-cols-6 to fit the new Total Passed card -->
+        <div class="grid grid-cols-6 gap-4 mb-8">
             <div class="bg-white p-6 rounded-lg shadow-sm border border-gray-200">
                 <h3 class="text-sm font-medium text-gray-500 uppercase">Total Checked</h3>
                 <p class="text-3xl font-bold">{{.TotalLoansChecked}}</p>
             </div>
+            
+            <!-- NEW: The Green Card displaying passed loans -->
+            <div class="bg-green-50 p-6 rounded-lg shadow-sm border border-green-100">
+                <h3 class="text-sm font-medium text-green-600 uppercase">Total Passed</h3>
+                <p class="text-3xl font-bold text-green-800">{{.TotalLoansPassed}}</p>
+            </div>
+
+            <div class="bg-purple-50 p-6 rounded-lg shadow-sm border border-purple-100">
+                <h3 class="text-sm font-medium text-purple-600 uppercase">Double-Pledged Assets</h3>
+                <p class="text-3xl font-bold text-purple-800">{{.TotalOverPledgedAssets}}</p>
+            </div>
+
             <div class="bg-red-50 p-6 rounded-lg shadow-sm border border-red-100">
                 <h3 class="text-sm font-medium text-red-500 uppercase">Rule 1 Failures</h3>
                 <p class="text-3xl font-bold text-red-700">{{.Rule1Fails}}</p>
@@ -356,7 +382,8 @@ func generateHTMLReport(data ReportData) {
         }
     </script>
 </body>
-</html>`
+</html>
+`
 
 	tmpl, err := template.New("report").Parse(htmlTemplate)
 	if err != nil {
