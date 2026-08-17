@@ -49,13 +49,16 @@ type OPAResponse struct {
 }
 
 type ReportData struct {
-	TotalLoansChecked int
-	TotalFailures     int
-	Rule1Fails        int
-	Rule2Fails        int
-	Rule3Fails        int
-	Portfolio         map[string]float64
-	FailedLoans       []FailedLoan
+	TotalLoansChecked      int
+	TotalLoansPassed       int
+	TotalFailures          int
+	Rule1Fails             int
+	Rule2Fails             int
+	Rule3Fails             int
+	TotalOverPledgedAssets int
+	AssetUsage             map[string]int
+	Portfolio              map[string]float64
+	FailedLoans            []FailedLoan
 }
 
 type FailedLoan struct {
@@ -66,16 +69,31 @@ type FailedLoan struct {
 }
 
 func fetchRates() (map[string]float64, error) {
-	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("https://api.frankfurter.dev/v1/latest")
+	client := http.Client{Timeout: 15 * time.Second}
+
+	req, err := http.NewRequest("GET", "https://api.frankfurter.app/latest", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
 	var data ExchangeRates
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
+
 	return data.Rates, nil
 }
 
@@ -83,6 +101,10 @@ func main() {
 	rates, err := fetchRates()
 	if err != nil {
 		log.Fatalf("Failed to fetch exchange rates: %v", err)
+	}
+
+	if rates == nil {
+		rates = make(map[string]float64)
 	}
 	rates["EUR"] = 1.0
 
@@ -99,16 +121,14 @@ func main() {
 
 	report := ReportData{
 		Portfolio:   make(map[string]float64),
+		AssetUsage:  make(map[string]int),
 		FailedLoans: []FailedLoan{},
 	}
 
-	// CONCURRENCY UPGRADES:
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	// Semaphore to limit concurrent HTTP requests to 50 so we don't crash OPA
 	sem := make(chan struct{}, 50)
 
-	// Reusable HTTP client so we don't exhaust local ports
 	client := &http.Client{
 		Transport: &http.Transport{
 			MaxIdleConnsPerHost: 50,
@@ -125,7 +145,6 @@ func main() {
 			continue
 		}
 
-		// Parse row variables safely outside the goroutine
 		loanID := record[0]
 		companyName := record[1]
 		hqCountry := record[2]
@@ -151,13 +170,12 @@ func main() {
 			expectedCurrency = "UNKNOWN"
 		}
 
-		// Start a Goroutine for this row
 		wg.Add(1)
-		sem <- struct{}{} // Claim a slot in the semaphore (max 50)
+		sem <- struct{}{}
 
 		go func(lID, cName, hq, aDesc, aOwner, cur, expCur string, aVal, lVal, lValEUR float64) {
 			defer wg.Done()
-			defer func() { <-sem }() // Release the slot when done
+			defer func() { <-sem }()
 
 			loanInput := LoanInput{
 				LoanID:           lID,
@@ -187,23 +205,41 @@ func main() {
 			}
 			resp.Body.Close()
 
-			// MUTEX LOCK: Safely update the shared report variables
 			mu.Lock()
 			report.Portfolio[cName] += lValEUR
 			report.TotalLoansChecked++
 
-			if !opaResult.Result.Allow {
-				report.TotalFailures++
+			// Check for Double Pledging
+			report.AssetUsage[aDesc]++
+			isDoublePledged := report.AssetUsage[aDesc] > 1
+
+			if report.AssetUsage[aDesc] == 2 {
+				report.TotalOverPledgedAssets++
+			}
+
+			// NEW LOGIC: Fail the loan if OPA rejects it OR if Go detects a double pledge
+			if !opaResult.Result.Allow || isDoublePledged {
 				violationsStr := strings.Join(opaResult.Result.Violations, "; ")
 
-				if strings.Contains(violationsStr, "Rule 1") {
-					report.Rule1Fails++
+				if !opaResult.Result.Allow {
+					report.TotalFailures++
+					if strings.Contains(violationsStr, "Rule 1") {
+						report.Rule1Fails++
+					}
+					if strings.Contains(violationsStr, "Rule 2") {
+						report.Rule2Fails++
+					}
+					if strings.Contains(violationsStr, "Rule 3") {
+						report.Rule3Fails++
+					}
 				}
-				if strings.Contains(violationsStr, "Rule 2") {
-					report.Rule2Fails++
-				}
-				if strings.Contains(violationsStr, "Rule 3") {
-					report.Rule3Fails++
+
+				// Append the Go-native warning
+				if isDoublePledged {
+					if violationsStr != "" {
+						violationsStr += " | "
+					}
+					violationsStr += "⚠️ SYSTEM WARNING: Asset Double Pledged"
 				}
 
 				details := fmt.Sprintf("Loan Value: %.2f %s | Asset Value: %.2f %s | HQ: %s", lVal, cur, aVal, cur, hq)
@@ -214,13 +250,15 @@ func main() {
 					Violations:  violationsStr,
 					LoanDetails: details,
 				})
+			} else {
+				report.TotalLoansPassed++
 			}
-			mu.Unlock() // MUTEX UNLOCK
+			mu.Unlock()
 		}(loanID, companyName, hqCountry, assetDesc, assetOwner, currency, expectedCurrency, assetValue, loanValue, loanValueEUR)
 	}
 
 	fmt.Println("Processing all rows concurrently... please wait.")
-	wg.Wait() // Wait for all 100,000 goroutines to finish
+	wg.Wait()
 
 	generateHTMLReport(report)
 }
@@ -238,11 +276,22 @@ func generateHTMLReport(data ReportData) {
     <div class="max-w-7xl mx-auto">
         <h1 class="text-3xl font-bold mb-8 text-gray-900">Loan Compliance Report</h1>
         
-        <div class="grid grid-cols-4 gap-4 mb-8">
+        <div class="grid grid-cols-6 gap-4 mb-8">
             <div class="bg-white p-6 rounded-lg shadow-sm border border-gray-200">
                 <h3 class="text-sm font-medium text-gray-500 uppercase">Total Checked</h3>
                 <p class="text-3xl font-bold">{{.TotalLoansChecked}}</p>
             </div>
+            
+            <div class="bg-green-50 p-6 rounded-lg shadow-sm border border-green-100">
+                <h3 class="text-sm font-medium text-green-600 uppercase">Total Passed</h3>
+                <p class="text-3xl font-bold text-green-800">{{.TotalLoansPassed}}</p>
+            </div>
+
+            <div class="bg-purple-50 p-6 rounded-lg shadow-sm border border-purple-100">
+                <h3 class="text-sm font-medium text-purple-600 uppercase">Double-Pledged Assets</h3>
+                <p class="text-3xl font-bold text-purple-800">{{.TotalOverPledgedAssets}}</p>
+            </div>
+
             <div class="bg-red-50 p-6 rounded-lg shadow-sm border border-red-100">
                 <h3 class="text-sm font-medium text-red-500 uppercase">Rule 1 Failures</h3>
                 <p class="text-3xl font-bold text-red-700">{{.Rule1Fails}}</p>
@@ -297,7 +346,6 @@ func generateHTMLReport(data ReportData) {
             btn.innerText = 'Analyzing...';
             btn.disabled = true;
 
-            // Remove existing result row if it was clicked before
             const existingRes = document.getElementById('res-' + loanID);
             if (existingRes) existingRes.remove();
 
@@ -313,12 +361,10 @@ func generateHTMLReport(data ReportData) {
                 });
                 const data = await response.json();
                 
-                // Create a new row to display the AI response gracefully
                 const newRow = document.createElement('tr');
                 newRow.id = 'res-' + loanID;
                 newRow.className = 'bg-indigo-50 border-l-4 border-indigo-500';
                 
-                // Convert simple Markdown bolding and newlines to HTML
                 const formattedText = data.remediation
                     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
                     .replace(/\n/g, '<br/>');
@@ -346,17 +392,16 @@ func generateHTMLReport(data ReportData) {
                 row.querySelector('td:nth-child(3)').innerHTML = '<span class="text-gray-500 font-bold">∅ Ignored</span>';
             }
             
-            // Remove the action buttons so it can't be clicked again
             row.querySelector('td:nth-child(4)').innerHTML = '<span class="text-gray-500 text-sm">Resolved</span>';
             
-            // Hide the AI suggestion row if it was open
             if (aiRow) {
                 aiRow.style.display = 'none';
             }
         }
     </script>
 </body>
-</html>`
+</html>
+`
 
 	tmpl, err := template.New("report").Parse(htmlTemplate)
 	if err != nil {
